@@ -79,7 +79,7 @@ If we make material changes to this Privacy Policy, we will update the "Last upd
 
 For questions, concerns, or to report a privacy issue, please open an issue on the Extension's GitHub repository:
 
-https://github.com/nidhinarode-bit/trinetlayer/issues
+https://github.com/nidhinarode-bit/Trinetlayer-/issues
 
 ---
 
