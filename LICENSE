@@ -1,0 +1,147 @@
+// TrinetLayer - content.js
+// DOM scanning + security header detection via fetch.
+// Injected on-demand by popup.js via chrome.scripting.executeScript.
+
+(function () {
+  "use strict";
+
+  // Guard: avoid re-registering the message listener if script is injected twice.
+  if (window.__trinetLayerContentLoaded) return;
+  window.__trinetLayerContentLoaded = true;
+
+  // ── DOM Scanner ────────────────────────────────────────────
+
+  function scanDOM() {
+    const forms         = document.querySelectorAll("form");
+    const inputs        = document.querySelectorAll("input, textarea, select");
+    const links         = document.querySelectorAll("a[href]");
+    const scripts       = document.querySelectorAll("script[src]");
+    const iframes       = document.querySelectorAll("iframe");
+    const passwordFields= document.querySelectorAll("input[type='password']");
+
+    // Collect HTML comments
+    const comments = [];
+    const walker = document.createTreeWalker(
+      document.documentElement,
+      NodeFilter.SHOW_COMMENT,
+      null
+    );
+    let node;
+    while ((node = walker.nextNode())) {
+      const text = node.nodeValue.trim();
+      if (text.length > 0) comments.push(text.substring(0, 300));
+    }
+
+    // Potential IDOR links
+    const idorPattern = /[?&](id|user_id|account|order|file|doc|record|uid|pid|ref|invoice|ticket)=\d+/i;
+    const potentialIdorLinks = [];
+    links.forEach(a => {
+      if (a.href && idorPattern.test(a.href)) {
+        potentialIdorLinks.push(a.href.substring(0, 200));
+      }
+    });
+
+    // Form details
+    const formDetails = [];
+    forms.forEach((form, i) => {
+      const formInputs = form.querySelectorAll("input, textarea, select");
+      const inputNames = Array.from(formInputs)
+        .map(inp => inp.name || inp.id || inp.type || "unnamed")
+        .filter(Boolean);
+      formDetails.push({
+        index:  i + 1,
+        action: form.action ? form.action.substring(0, 200) : "(none)",
+        method: (form.method || "GET").toUpperCase(),
+        inputs: inputNames.slice(0, 15)
+      });
+    });
+
+    // External script sources
+    const externalScripts = Array.from(scripts)
+      .map(s => s.src.substring(0, 200))
+      .filter(Boolean);
+
+    return {
+      counts: {
+        forms:          forms.length,
+        inputs:         inputs.length,
+        links:          links.length,
+        scripts:        scripts.length,
+        iframes:        iframes.length,
+        comments:       comments.length,
+        passwordFields: passwordFields.length
+      },
+      formDetails:       formDetails.slice(0, 10),
+      potentialIdorLinks:potentialIdorLinks.slice(0, 10),
+      externalScripts:   externalScripts.slice(0, 10),
+      htmlComments:      comments.slice(0, 5),
+      pageTitle:         document.title,
+    };
+  }
+
+  // ── Security Header Fetcher ────────────────────────────────
+  // Performs a HEAD request to the current page to capture response headers.
+  // Runs only when explicitly requested by the popup.
+
+  const SECURITY_HEADERS = [
+    "content-security-policy",
+    "x-frame-options",
+    "x-content-type-options",
+    "strict-transport-security",
+    "referrer-policy",
+    "permissions-policy",
+    "cross-origin-opener-policy",
+    "cross-origin-embedder-policy",
+    "cross-origin-resource-policy"
+  ];
+
+  async function fetchSecurityHeaders() {
+    try {
+      const res = await fetch(window.location.href, {
+        method: "HEAD",
+        credentials: "omit",
+        cache: "no-store"
+      });
+      const found = {};
+      SECURITY_HEADERS.forEach(name => {
+        const val = res.headers.get(name);
+        if (val) found[name] = val;
+      });
+      return found;
+    } catch {
+      // Network error or CORS — ignore
+      return {};
+    }
+  }
+
+  // ── Message handler ────────────────────────────────────────
+
+  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    // Only accept messages from our own extension.
+    if (!sender || sender.id !== chrome.runtime.id) return false;
+    if (!message || typeof message !== "object") return false;
+
+    if (message.type === "SCAN_DOM") {
+      try {
+        const data = scanDOM();
+        sendResponse({ success: true, data });
+      } catch (e) {
+        sendResponse({ success: false, error: e.message });
+      }
+      return false;
+    }
+
+    if (message.type === "FETCH_HEADERS") {
+      // Only fetch for main-frame http/https pages.
+      if (window !== window.top || !/^https?:/.test(window.location.protocol)) {
+        sendResponse({ success: false, headers: {} });
+        return false;
+      }
+      fetchSecurityHeaders().then(headers => sendResponse({ success: true, headers }));
+      return true; // async response
+    }
+
+    return false;
+  });
+
+})();

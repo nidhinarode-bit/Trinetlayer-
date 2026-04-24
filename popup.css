@@ -1,0 +1,912 @@
+// TrinetLayer — popup.js
+// Main extension logic. No eval, no unsafe patterns.
+
+"use strict";
+
+// ═══════════════════════════════════════════════════════════════
+// UTILITIES
+// ═══════════════════════════════════════════════════════════════
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#039;");
+}
+
+function getRootDomain(url) {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
+}
+
+function formatTimestamp(date) {
+  const d = date || new Date();
+  return d.toLocaleString("en-US", {
+    month: "short", day: "2-digit",
+    hour: "2-digit", minute: "2-digit",
+    hour12: false
+  });
+}
+
+let toastTimer = null;
+function showToast(msg, isError = false) {
+  const toast = document.getElementById("toast");
+  // Force hide first so removing it re-triggers the CSS animation every time
+  toast.classList.add("hidden");
+  void toast.offsetWidth; // force reflow — restarts animation
+  toast.textContent = msg;
+  toast.className = "toast" + (isError ? " error" : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => {
+    toast.classList.add("hidden");
+  }, 2000);
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    // Fallback
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TAB NAVIGATION
+// ═══════════════════════════════════════════════════════════════
+
+function initTabs() {
+  const btns = document.querySelectorAll(".tab-btn");
+  const contents = document.querySelectorAll(".tab-content");
+
+  btns.forEach(btn => {
+    btn.addEventListener("click", () => {
+      const target = btn.dataset.tab;
+      btns.forEach(b => b.classList.remove("active"));
+      contents.forEach(c => c.classList.remove("active"));
+      btn.classList.add("active");
+      document.getElementById("tab-" + target).classList.add("active");
+    });
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SCOPE BADGE (header)
+// ═══════════════════════════════════════════════════════════════
+
+async function updateScopeBadge(url) {
+  const dot   = document.getElementById("scopeDot");
+  const label = document.getElementById("scopeLabel");
+
+  const result = await chrome.storage.local.get("scopeDomains");
+  const scopeDomains = result.scopeDomains || [];
+
+  if (!url || !url.startsWith("http") || scopeDomains.length === 0) {
+    dot.className   = "scope-dot";
+    label.textContent = "—";
+    return;
+  }
+
+  try {
+    const response = await chrome.runtime.sendMessage({
+      type: "GET_SCOPE_STATUS",
+      url
+    });
+    if (response.inScope === true) {
+      dot.className   = "scope-dot in-scope";
+      label.textContent = "IN SCOPE";
+    } else {
+      dot.className   = "scope-dot out-scope";
+      label.textContent = "OUT OF SCOPE";
+    }
+  } catch {
+    dot.className   = "scope-dot";
+    label.textContent = "—";
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PAYLOAD LIBRARY
+// ═══════════════════════════════════════════════════════════════
+
+let allPayloads   = [];
+let activeCategory = "ALL";
+let activeTag     = "";
+let searchQuery   = "";
+
+async function loadPayloads() {
+  // Load built-in payloads from JSON
+  let builtIn = [];
+  try {
+    const url = chrome.runtime.getURL("payloadData.json");
+    const res = await fetch(url);
+    const data = await res.json();
+    builtIn = data.payloads || [];
+  } catch (e) {
+    console.warn("Failed to load payloadData.json:", e);
+  }
+
+  // Load custom payloads from storage
+  const stored = await chrome.storage.local.get("customPayloads");
+  const custom = (stored.customPayloads || []).map(p => ({
+    ...p,
+    isCustom: true
+  }));
+
+  allPayloads = [...builtIn, ...custom];
+  populateTagFilter();
+  renderPayloads();
+}
+
+function populateTagFilter() {
+  const sel = document.getElementById("tagFilter");
+  const tags = new Set();
+  allPayloads.forEach(p => (p.tags || []).forEach(t => tags.add(t)));
+  sel.innerHTML = '<option value="">All Tags</option>';
+  [...tags].sort().forEach(tag => {
+    const opt = document.createElement("option");
+    opt.value = tag;
+    opt.textContent = tag;
+    sel.appendChild(opt);
+  });
+}
+
+function filterPayloads() {
+  return allPayloads.filter(p => {
+    const catOk  = activeCategory === "ALL" || p.category === activeCategory;
+    const tagOk  = !activeTag || (p.tags || []).includes(activeTag);
+    const qLower = searchQuery.toLowerCase();
+    const searchOk = !qLower || [p.name, p.category, p.payload, p.description, ...(p.tags || [])]
+      .join(" ").toLowerCase().includes(qLower);
+    return catOk && tagOk && searchOk;
+  });
+}
+
+function renderPayloads() {
+  const list    = document.getElementById("payloadList");
+  const counter = document.getElementById("payloadCount");
+  const filtered = filterPayloads();
+
+  counter.textContent = `${filtered.length} payload${filtered.length !== 1 ? "s" : ""}`;
+
+  if (filtered.length === 0) {
+    list.innerHTML = `<div class="payload-empty">No payloads match your filter.</div>`;
+    return;
+  }
+
+  list.innerHTML = filtered.map(p => {
+    const catClass = `cat-${escapeHtml(p.category)}`;
+    const tagsHtml = (p.tags || [])
+      .map(t => `<span class="payload-tag">${escapeHtml(t)}</span>`)
+      .join("");
+    const deleteBtn = p.isCustom
+      ? `<button class="btn-delete-payload" data-id="${escapeHtml(p.id)}" title="Delete">✕</button>`
+      : "";
+
+    return `
+      <div class="payload-card ${p.isCustom ? "custom-payload" : ""}" data-id="${escapeHtml(p.id)}">
+        <div class="payload-card-header">
+          <span class="payload-category ${catClass}">${escapeHtml(p.category)}</span>
+          <span class="payload-name">${escapeHtml(p.name)}</span>
+          ${deleteBtn}
+        </div>
+        ${p.description ? `<div class="payload-desc">${escapeHtml(p.description)}</div>` : ""}
+        <div class="payload-code" data-payload="${escapeHtml(p.payload)}">${escapeHtml(p.payload)}</div>
+        <div class="payload-footer">
+          <div class="payload-tags">${tagsHtml}</div>
+          <button class="btn-copy" data-payload="${escapeHtml(p.payload)}">⧉ Copy</button>
+        </div>
+      </div>`;
+  }).join("");
+
+  // Event listeners for copy buttons
+  list.querySelectorAll(".btn-copy").forEach(btn => {
+    btn.addEventListener("click", async () => {
+      const payload = btn.dataset.payload;
+      const ok = await copyToClipboard(payload);
+      if (ok) {
+        btn.textContent = "✓ Copied!";
+        btn.classList.add("copied");
+        showToast("Payload copied to clipboard");
+        setTimeout(() => {
+          btn.textContent = "⧉ Copy";
+          btn.classList.remove("copied");
+        }, 1500);
+      }
+    });
+  });
+
+  // Event listeners for delete buttons
+  list.querySelectorAll(".btn-delete-payload").forEach(btn => {
+    btn.addEventListener("click", async (e) => {
+      e.stopPropagation();
+      const id = btn.dataset.id;
+      await deleteCustomPayload(id);
+    });
+  });
+}
+
+async function deleteCustomPayload(id) {
+  const stored = await chrome.storage.local.get("customPayloads");
+  const custom = (stored.customPayloads || []).filter(p => p.id !== id);
+  await chrome.storage.local.set({ customPayloads: custom });
+  await loadPayloads();
+  showToast("Payload deleted");
+}
+
+function initPayloadTab() {
+  // Search
+  document.getElementById("payloadSearch").addEventListener("input", e => {
+    searchQuery = e.target.value;
+    renderPayloads();
+  });
+
+  // Category filter chips
+  document.getElementById("categoryFilters").addEventListener("click", e => {
+    const chip = e.target.closest(".filter-chip");
+    if (!chip) return;
+    document.querySelectorAll(".filter-chip").forEach(c => c.classList.remove("active"));
+    chip.classList.add("active");
+    activeCategory = chip.dataset.cat;
+    renderPayloads();
+  });
+
+  // Tag filter
+  document.getElementById("tagFilter").addEventListener("change", e => {
+    activeTag = e.target.value;
+    renderPayloads();
+  });
+
+  // Add payload modal
+  document.getElementById("addPayloadBtn").addEventListener("click", () => {
+    document.getElementById("addPayloadModal").classList.remove("hidden");
+  });
+
+  document.getElementById("closeAddModal").addEventListener("click", closeAddModal);
+  document.getElementById("cancelAddModal").addEventListener("click", closeAddModal);
+
+  document.getElementById("addPayloadModal").addEventListener("click", e => {
+    if (e.target === document.getElementById("addPayloadModal")) closeAddModal();
+  });
+
+  document.getElementById("savePayloadBtn").addEventListener("click", saveCustomPayload);
+}
+
+function closeAddModal() {
+  document.getElementById("addPayloadModal").classList.add("hidden");
+  document.getElementById("newPayloadName").value     = "";
+  document.getElementById("newPayloadTags").value     = "";
+  document.getElementById("newPayloadDesc").value     = "";
+  document.getElementById("newPayloadValue").value    = "";
+}
+
+async function saveCustomPayload() {
+  const name    = document.getElementById("newPayloadName").value.trim();
+  const category= document.getElementById("newPayloadCategory").value;
+  const tagsRaw = document.getElementById("newPayloadTags").value;
+  const desc    = document.getElementById("newPayloadDesc").value.trim();
+  const payload = document.getElementById("newPayloadValue").value.trim();
+
+  if (!name || !payload) {
+    showToast("Name and Payload are required", true);
+    return;
+  }
+
+  // Validate max lengths
+  if (name.length > 100 || payload.length > 5000 || desc.length > 500) {
+    showToast("Input exceeds maximum length", true);
+    return;
+  }
+
+  const tags = tagsRaw.split(",")
+    .map(t => t.trim())
+    .filter(t => t.length > 0 && t.length < 50)
+    .slice(0, 10);
+
+  const newPayload = {
+    id:       "custom-" + crypto.randomUUID(),
+    name,
+    category,
+    tags,
+    description: desc,
+    payload,
+    isCustom: true,
+    createdAt: new Date().toISOString()
+  };
+
+  const stored = await chrome.storage.local.get("customPayloads");
+  const custom = stored.customPayloads || [];
+
+  // Limit custom payloads to 200
+  if (custom.length >= 200) {
+    showToast("Max 200 custom payloads reached", true);
+    return;
+  }
+
+  custom.push(newPayload);
+  await chrome.storage.local.set({ customPayloads: custom });
+  closeAddModal();
+  await loadPayloads();
+  showToast("Custom payload saved!");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NOTES & RECON LOG
+// ═══════════════════════════════════════════════════════════════
+
+let currentTabUrl     = null;
+let currentDomainKey  = null;
+
+async function initNotesTab(url) {
+  currentTabUrl = url;
+  // Use hostname for http/https pages; create a safe unique key for others
+  let domain;
+  if (url && /^https?:\/\//i.test(url)) {
+    domain = getRootDomain(url) || "unknown";
+  } else if (url && url.startsWith("chrome://")) {
+    domain = "chrome::" + (getRootDomain(url) || "internal");
+  } else if (url) {
+    // about:blank, file://, etc. — use sanitized URL prefix
+    domain = "page::" + url.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 60);
+  } else {
+    domain = "unknown";
+  }
+  // Use "::" separator — colons are illegal in hostnames so no collision possible
+  currentDomainKey = "notes::" + domain;
+
+  document.getElementById("domainText").textContent = domain.replace(/^(chrome|page)::/, "");
+
+  // Load existing notes — use "::" separator for history key too (Bug #3 fix)
+  const histKey = currentDomainKey + "::history";
+  const stored = await chrome.storage.local.get([currentDomainKey, histKey]);
+  const notes  = stored[currentDomainKey] || "";
+  document.getElementById("notesArea").value = notes;
+
+  renderNoteHistory(stored[histKey] || []);
+  updateNotesMeta(stored[histKey] || []);
+
+  // Save button
+  document.getElementById("saveNotesBtn").onclick = saveNotes;
+
+  // Export button
+  document.getElementById("exportNotesBtn").onclick = exportNotes;
+}
+
+async function saveNotes() {
+  const text = document.getElementById("notesArea").value;
+  const timestamp = new Date().toISOString();
+
+  const histKey = currentDomainKey + "::history";
+  const stored  = await chrome.storage.local.get(histKey);
+  const history = stored[histKey] || [];
+
+  history.unshift({
+    timestamp,
+    preview: text.slice(0, 80).replace(/\n/g, " ")
+  });
+
+  // Keep only last 20 snapshots
+  const trimmed = history.slice(0, 20);
+
+  await chrome.storage.local.set({
+    [currentDomainKey]: text,
+    [histKey]: trimmed
+  });
+
+  renderNoteHistory(trimmed);
+  updateNotesMeta(trimmed);
+  showToast("Notes saved ✓");
+}
+
+function updateNotesMeta(history) {
+  const el = document.getElementById("notesMeta");
+  if (history.length === 0) {
+    el.textContent = "No saves yet";
+  } else {
+    el.textContent = "Last saved: " + formatTimestamp(new Date(history[0].timestamp));
+  }
+}
+
+function renderNoteHistory(history) {
+  const container = document.getElementById("notesHistory");
+  if (history.length === 0) {
+    container.innerHTML = "";
+    return;
+  }
+  container.innerHTML = history.slice(0, 5).map(h => `
+    <div class="history-entry">
+      <span class="history-preview">${escapeHtml(h.preview || "(empty)")}</span>
+      <span class="history-timestamp">${formatTimestamp(new Date(h.timestamp))}</span>
+    </div>
+  `).join("");
+}
+
+async function exportNotes() {
+  const domain  = getRootDomain(currentTabUrl) || "unknown";
+  const text    = document.getElementById("notesArea").value;
+  const date    = new Date().toISOString().split("T")[0];
+  // Sanitize domain for use in filename (remove any chars unsafe in filenames)
+  const safeDomain = domain.replace(/[^a-zA-Z0-9._-]/g, "_");
+
+  const mdContent = `# Recon Notes — ${domain}\n_Exported: ${new Date().toLocaleString()}_\n\n---\n\n${text}\n`;
+
+  const blob = new Blob([mdContent], { type: "text/markdown" });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href     = url;
+  a.download = `bounty-notes-${safeDomain}-${date}.md`;
+  a.click();
+  // Delay revocation so browser has time to initiate the download (Bug #4 fix)
+  setTimeout(() => URL.revokeObjectURL(url), 10000);
+  showToast("Notes exported as .md");
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PAGE INFO (DOM + HEADERS)
+// ═══════════════════════════════════════════════════════════════
+
+const EXPECTED_HEADERS = [
+  { key: "content-security-policy",        label: "CSP" },
+  { key: "x-frame-options",               label: "X-Frame-Options" },
+  { key: "x-content-type-options",        label: "X-Content-Type-Options" },
+  { key: "strict-transport-security",     label: "HSTS" },
+  { key: "referrer-policy",               label: "Referrer-Policy" },
+  { key: "permissions-policy",            label: "Permissions-Policy" },
+  { key: "cross-origin-opener-policy",    label: "COOP" },
+  { key: "cross-origin-embedder-policy",  label: "COEP" },
+  { key: "cross-origin-resource-policy",  label: "CORP" }
+];
+
+function initInfoTab() {
+  document.getElementById("scanPageBtn").addEventListener("click", scanPage);
+}
+
+/**
+ * Ensure the content script is loaded in the target tab.
+ * Returns { ok: true } on success, or { ok: false, reason: string } on failure.
+ */
+async function ensureContentScript(tabId) {
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files:  ["content.js"]
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, reason: (e && e.message) || "unknown error" };
+  }
+}
+
+async function scanPage() {
+  const btn = document.getElementById("scanPageBtn");
+  btn.textContent = "⏳ Scanning…";
+  btn.disabled = true;
+
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+
+    // Guard: content scripts don't run on chrome:// or about: pages
+    if (!tab?.url || !/^https?:\/\//i.test(tab.url)) {
+      showToast("Scan only works on http(s) pages", true);
+      return;
+    }
+
+    // Additional guard: Chrome blocks injection on some special http(s) pages.
+    const blocked = /^https?:\/\/(chrome\.google\.com\/webstore|chromewebstore\.google\.com)/i;
+    if (blocked.test(tab.url)) {
+      showToast("Chrome blocks extensions on the Web Store page", true);
+      return;
+    }
+
+    // Inject content script on demand (user-gated via activeTab)
+    const injected = await ensureContentScript(tab.id);
+    if (!injected.ok) {
+      // Classify common causes for a helpful message.
+      const reason = (injected.reason || "").toLowerCase();
+      let msg;
+      if (reason.includes("cannot access") || reason.includes("cannot be scripted")) {
+        msg = "Chrome blocks extensions on this page";
+      } else if (reason.includes("no tab with id") || reason.includes("frame")) {
+        msg = "Tab closed or navigating — try again";
+      } else {
+        msg = "Injection failed: " + (injected.reason || "unknown");
+      }
+      showToast(msg, true);
+      return;
+    }
+
+    // DOM scan via content script
+    let domData = null;
+    try {
+      const response = await chrome.tabs.sendMessage(tab.id, { type: "SCAN_DOM" });
+      if (response?.success) domData = response.data;
+    } catch {
+      domData = null;
+    }
+
+    // Security headers via content script (synchronous — no timing race)
+    let headers = {};
+    try {
+      const hResp = await chrome.tabs.sendMessage(tab.id, { type: "FETCH_HEADERS" });
+      if (hResp?.success) headers = hResp.headers || {};
+    } catch {
+      headers = {};
+    }
+
+    renderInfoResults(domData, headers);
+
+    document.getElementById("infoResults").classList.remove("hidden");
+    document.getElementById("infoEmpty").classList.add("hidden");
+  } catch (e) {
+    showToast("Scan failed: " + e.message, true);
+  } finally {
+    btn.textContent = "⚡ Scan Current Page";
+    btn.disabled = false;
+  }
+}
+
+function renderInfoResults(dom, headers) {
+  // Stat counts
+  const counts = dom?.counts || {};
+  document.getElementById("statForms").textContent    = counts.forms    ?? "—";
+  document.getElementById("statInputs").textContent   = counts.inputs   ?? "—";
+  document.getElementById("statLinks").textContent    = counts.links    ?? "—";
+  document.getElementById("statScripts").textContent  = counts.scripts  ?? "—";
+  document.getElementById("statIframes").textContent  = counts.iframes  ?? "—";
+  document.getElementById("statComments").textContent = counts.comments ?? "—";
+
+  // Security headers
+  const headerList = document.getElementById("headerList");
+  headerList.innerHTML = EXPECTED_HEADERS.map(h => {
+    const val     = headers[h.key];
+    const present = !!val;
+    const statusClass = present ? "present" : "missing";
+    const valueHtml   = present
+      ? `<span class="header-value">${escapeHtml(val.substring(0, 100))}</span>`
+      : `<span class="header-value missing-text">NOT SET</span>`;
+    return `
+      <div class="header-row">
+        <div class="header-status ${statusClass}"></div>
+        <span class="header-name">${escapeHtml(h.label)}</span>
+        ${valueHtml}
+      </div>`;
+  }).join("");
+
+  // Form details
+  const formDetails = dom?.formDetails || [];
+  const formSec = document.getElementById("formDetailsSection");
+  const formList = document.getElementById("formDetailsList");
+  if (formDetails.length > 0) {
+    formSec.classList.remove("hidden");
+    formList.innerHTML = formDetails.map(f => `
+      <div class="form-detail-item">
+        <div class="form-detail-meta">
+          <strong>Form #${f.index}</strong> — ${escapeHtml(f.method)}
+          → <span style="color:var(--text-muted)">${escapeHtml(f.action)}</span>
+        </div>
+        <div class="form-detail-inputs">Fields: ${escapeHtml((f.inputs || []).join(", ") || "(none)")}</div>
+      </div>`).join("");
+  } else {
+    formSec.classList.add("hidden");
+  }
+
+  // IDOR links
+  const idorLinks = dom?.potentialIdorLinks || [];
+  const idorSec  = document.getElementById("idorSection");
+  const idorList = document.getElementById("idorList");
+  if (idorLinks.length > 0) {
+    idorSec.classList.remove("hidden");
+    idorList.innerHTML = idorLinks.map(link => `
+      <div class="idor-item" title="Click to copy" data-url="${escapeHtml(link)}">
+        ${escapeHtml(link)}
+      </div>`).join("");
+    idorList.querySelectorAll(".idor-item").forEach(item => {
+      item.addEventListener("click", async () => {
+        await copyToClipboard(item.dataset.url);
+        showToast("URL copied");
+      });
+    });
+  } else {
+    idorSec.classList.add("hidden");
+  }
+
+  // HTML Comments
+  const comments = dom?.htmlComments || [];
+  const commentsSec  = document.getElementById("commentsSection");
+  const commentsList = document.getElementById("commentsList");
+  if (comments.length > 0) {
+    commentsSec.classList.remove("hidden");
+    commentsList.innerHTML = comments.map(c => `
+      <div class="comment-item">${escapeHtml(c)}</div>`).join("");
+  } else {
+    commentsSec.classList.add("hidden");
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// UTILITIES TAB
+// ═══════════════════════════════════════════════════════════════
+
+// UTF-8-safe Base64 helpers using TextEncoder/TextDecoder (modern, non-deprecated).
+function safeBase64Encode(str) {
+  try {
+    const bytes = new TextEncoder().encode(str);
+    let bin = "";
+    for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+  } catch {
+    throw new Error("Cannot encode: invalid input");
+  }
+}
+
+function safeBase64Decode(str) {
+  try {
+    const bin = atob(str.trim());
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+  } catch {
+    // Try raw decode
+    try {
+      return atob(str.trim());
+    } catch {
+      throw new Error("Invalid Base64 string");
+    }
+  }
+}
+
+function initUtilsTab() {
+  // Base64
+  document.getElementById("b64EncodeBtn").addEventListener("click", () => {
+    const inp = document.getElementById("b64Input").value;
+    const out = document.getElementById("b64Output");
+    try {
+      out.textContent = safeBase64Encode(inp);
+      out.className   = "util-output";
+    } catch (e) {
+      out.textContent = e.message;
+      out.className   = "util-output error";
+    }
+  });
+
+  document.getElementById("b64DecodeBtn").addEventListener("click", () => {
+    const inp = document.getElementById("b64Input").value;
+    const out = document.getElementById("b64Output");
+    try {
+      out.textContent = safeBase64Decode(inp);
+      out.className   = "util-output";
+    } catch (e) {
+      out.textContent = e.message;
+      out.className   = "util-output error";
+    }
+  });
+
+  document.getElementById("b64CopyBtn").addEventListener("click", async () => {
+    const outEl = document.getElementById("b64Output");
+    const text = outEl.textContent;
+    if (text && !outEl.classList.contains("error")) {
+      await copyToClipboard(text);
+      showToast("Copied!");
+    } else if (!text) {
+      showToast("Nothing to copy", true);
+    }
+  });
+
+  document.getElementById("b64ClearBtn").addEventListener("click", () => {
+    document.getElementById("b64Input").value  = "";
+    document.getElementById("b64Output").textContent = "";
+  });
+
+  // URL Encode
+  document.getElementById("urlEncBtn").addEventListener("click", () => {
+    const inp = document.getElementById("urlInput").value;
+    const out = document.getElementById("urlOutput");
+    try {
+      out.textContent = encodeURIComponent(inp);
+      out.className   = "util-output";
+    } catch (e) {
+      out.textContent = e.message;
+      out.className   = "util-output error";
+    }
+  });
+
+  document.getElementById("urlDecBtn").addEventListener("click", () => {
+    const inp = document.getElementById("urlInput").value;
+    const out = document.getElementById("urlOutput");
+    try {
+      out.textContent = decodeURIComponent(inp);
+      out.className   = "util-output";
+    } catch (e) {
+      out.textContent = "Invalid URL-encoded string";
+      out.className   = "util-output error";
+    }
+  });
+
+  document.getElementById("urlCopyBtn").addEventListener("click", async () => {
+    const outEl = document.getElementById("urlOutput");
+    const text = outEl.textContent;
+    if (text && !outEl.classList.contains("error")) {
+      await copyToClipboard(text);
+      showToast("Copied!");
+    } else if (!text) {
+      showToast("Nothing to copy", true);
+    }
+  });
+
+  document.getElementById("urlClearBtn").addEventListener("click", () => {
+    document.getElementById("urlInput").value   = "";
+    document.getElementById("urlOutput").textContent = "";
+  });
+
+  // JWT Decoder
+  document.getElementById("jwtDecodeBtn").addEventListener("click", decodeJWT);
+  document.getElementById("jwtClearBtn").addEventListener("click", () => {
+    document.getElementById("jwtInput").value = "";
+    document.getElementById("jwtHeaderPre").textContent  = "";
+    document.getElementById("jwtPayloadPre").textContent = "";
+    document.getElementById("jwtSigNote").textContent    = "";
+  });
+}
+
+function decodeJWT() {
+  const raw    = document.getElementById("jwtInput").value.trim();
+  const header = document.getElementById("jwtHeaderPre");
+  const payload= document.getElementById("jwtPayloadPre");
+  const sig    = document.getElementById("jwtSigNote");
+
+  if (!raw) {
+    showToast("Paste a JWT token first", true);
+    return;
+  }
+
+  const parts = raw.split(".");
+  if (parts.length !== 3) {
+    header.textContent  = "Invalid JWT (expected 3 parts separated by '.')";
+    payload.textContent = "";
+    sig.textContent     = "";
+    return;
+  }
+
+  const decodeJWTPart = (part) => {
+    // JWT uses base64url; convert to standard base64 and pad.
+    const b64 = part.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = b64 + "=".repeat((4 - b64.length % 4) % 4);
+    try {
+      return JSON.parse(safeBase64Decode(padded));
+    } catch {
+      return { error: "Could not decode this section" };
+    }
+  };
+
+  header.textContent  = JSON.stringify(decodeJWTPart(parts[0]), null, 2);
+  payload.textContent = JSON.stringify(decodeJWTPart(parts[1]), null, 2);
+  sig.textContent     = `[Raw] ${parts[2].substring(0, 60)}…\nSignature is NOT verified. Do not trust unsigned tokens.`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SCOPE MANAGER
+// ═══════════════════════════════════════════════════════════════
+
+async function initScopeTab() {
+  const stored = await chrome.storage.local.get("scopeDomains");
+  const domains = stored.scopeDomains || [];
+  document.getElementById("scopeInput").value = domains.join("\n");
+  updateScopeMeta(domains);
+
+  document.getElementById("saveScopeBtn").onclick = saveScope;
+  document.getElementById("scopeTestBtn").onclick = testScopeUrl;
+}
+
+async function saveScope() {
+  const raw     = document.getElementById("scopeInput").value;
+  const domains = raw.split("\n")
+    .map(d => d.trim())
+    .filter(d => d.length > 0 && d.length < 200);
+
+  // Validate entries — allow plain domains and *.domain wildcards only
+  const valid = domains.filter(d => {
+    // Strip leading wildcard for validation
+    const base = d.startsWith("*.") ? d.slice(2) : d;
+    // Each label: starts/ends with alphanumeric, may contain hyphens, 1–63 chars
+    // Must have at least two labels (TLD required), TLD letters only
+    return /^(?:[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/.test(base);
+  });
+  const invalid = domains.length - valid.length;
+
+  await chrome.storage.local.set({ scopeDomains: valid });
+  updateScopeMeta(valid);
+
+  // Notify background to update icons
+  try {
+    await chrome.runtime.sendMessage({ type: "SCOPE_UPDATED" });
+  } catch { /* ignore */ }
+
+  // Refresh the popup's own header badge so the current tab's in/out status
+  // updates immediately — without this the user had to reopen the popup.
+  await updateScopeBadge(currentTabUrl);
+
+  if (invalid > 0) {
+    showToast(`Saved ${valid.length} domains (${invalid} invalid removed)`, true);
+  } else {
+    showToast(`Scope saved: ${valid.length} domain${valid.length !== 1 ? "s" : ""}`);
+  }
+}
+
+function updateScopeMeta(domains) {
+  document.getElementById("scopeMeta").textContent =
+    `${domains.length} domain${domains.length !== 1 ? "s" : ""} loaded`;
+}
+
+async function testScopeUrl() {
+  const input  = document.getElementById("scopeTestInput").value.trim();
+  const result = document.getElementById("scopeTestResult");
+
+  if (!input) {
+    showToast("Enter a URL to test", true);
+    return;
+  }
+
+  let testUrl = input;
+  if (!testUrl.startsWith("http")) testUrl = "https://" + testUrl;
+
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      type: "GET_SCOPE_STATUS",
+      url: testUrl
+    });
+
+    result.classList.remove("hidden");
+    if (resp.inScope === true) {
+      result.className  = "scope-test-result in-scope";
+      result.textContent = "✓ IN SCOPE";
+    } else if (resp.inScope === false) {
+      result.className  = "scope-test-result out-scope";
+      result.textContent = "✗ OUT OF SCOPE";
+    } else {
+      result.className  = "scope-test-result out-scope";
+      result.textContent = "⚠ No scope defined";
+    }
+  } catch {
+    showToast("Scope check failed", true);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN INIT
+// ═══════════════════════════════════════════════════════════════
+
+async function init() {
+  // Get current tab
+  let currentTab = null;
+  try {
+    [currentTab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  } catch { /* ignore */ }
+
+  const currentUrl = currentTab?.url || "";
+
+  // Init modules
+  initTabs();
+  await loadPayloads();
+  initPayloadTab();
+  await initNotesTab(currentUrl);
+  initInfoTab();
+  initUtilsTab();
+  await initScopeTab();
+  await updateScopeBadge(currentUrl);
+}
+
+document.addEventListener("DOMContentLoaded", init);
